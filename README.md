@@ -1,7 +1,7 @@
 # Lock-Free Queue Benchmarks
 
 A C++ benchmark suite comparing **lock-free** and **mutex-based** queue implementations under multi-threaded workloads.  
-Includes MPSC (multi-producer single-consumer) and SPSC (single-producer single-consumer) queues, built from scratch to explore performance trade-offs in concurrent data structures.
+Includes SPSC (single-producer single-consumer) queues implementation, built from scratch to explore performance trade-offs in concurrent data structures.
 
 ---
 
