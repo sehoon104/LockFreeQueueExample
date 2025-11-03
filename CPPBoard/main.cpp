@@ -1,101 +1,113 @@
-#include <stdio.h>
-#include <iostream>
-#include <atomic>
+﻿#include <atomic>
+#include <chrono>
 #include <cstddef>
-#include <stdexcept>
-#include <utility>
-#include <new>
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <queue>
 #include <thread>
 #include <vector>
-#include <memory>
-#include <string>
-#include "MPSCQ.h" 
+#include "Buffers.h"
 
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
+#include <immintrin.h>
+static inline void cpu_relax() noexcept { _mm_pause(); }
+#else
+static inline void cpu_relax() noexcept { std::this_thread::yield(); }
+#endif
 
-//Example Lock Free Queue
-int main()
-{
-    MPSCQ<int> mpscq(1024);
-    MPSCQ<std::string> logServer(1024);
-    std::atomic<bool> shutdown{ false };
+struct Result {
+    double seconds{};
+    uint64_t produced{};
+    uint64_t consumed{};
+    double throughput_mps{}; // consumed / s (million items/sec)
+};
 
-    // consumer pop value produced by producer threads
-    std::thread consumerThread([&] {
-        while (!shutdown.load(std::memory_order_acquire)) {
-            int val;
-            while (mpscq.pop(val))
-            {    //Adding log slows down, but adding for demo
-                logServer.push("[consumer] popped: " + std::to_string(val) + "\n");
-            }
+template <typename Push, typename Pop>
+Result run_spsc_bench(Push push, Pop pop, std::chrono::seconds dur) {
+    std::atomic<bool> stop{ false };
+    std::atomic<uint64_t> produced{ 0 }, consumed{ 0 };
+
+    // Consumer thread: spin-drain with light backoff
+    std::thread consumer([&] {
+        uint64_t v;
+        while (!stop.load(std::memory_order_acquire)) {
+            size_t got = 0;
+            while (pop(v)) { ++got; }
+            if (got == 0) cpu_relax();
+            consumed.fetch_add(got, std::memory_order_relaxed);
         }
+        // Grace drain a bit
+        auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        size_t got = 0;
+        do { while (pop(v)) ++got; } while (std::chrono::steady_clock::now() < until);
+        consumed.fetch_add(got, std::memory_order_relaxed);
+        });
 
-        // optional: drain at termination
-        int val;
-        while (mpscq.pop(val)) {
-            logServer.push("[consumer] final drain: " + std::to_string(val) + "\n");
+    // Producer (single): flat-out with light backoff on full
+    std::thread producer([&] {
+        uint64_t x = 0;
+        while (!stop.load(std::memory_order_acquire)) {
+            if (push(x)) {
+                ++x;
+                produced.fetch_add(1, std::memory_order_relaxed);
+            }
+            else {
+                for (int i = 0; i < 64; ++i) cpu_relax();
+            }
         }
         });
 
-    std::thread logServerThread([&] {
-        std::string logVal;
-        while (!shutdown.load(std::memory_order_acquire))
-        {
-            while (logServer.pop(logVal))
-            {
-                std::cout << logVal;
-            }
-        }
+    auto t0 = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(dur);
+    stop.store(true, std::memory_order_release);
+    producer.join();
+    consumer.join();
+    auto t1 = std::chrono::steady_clock::now();
 
-        while (logServer.pop(logVal))
-        {
-            std::cout << logVal;
-        }
-        });
+    double sec = std::chrono::duration_cast<std::chrono::duration<double>>(t1 - t0).count();
+    uint64_t cons = consumed.load(std::memory_order_relaxed);
+    return { sec, produced.load(std::memory_order_relaxed), cons, (cons / 1e6) / sec };
+}
 
-    // make multiple producers
-    const int producerCount = 5;
-    std::vector<std::thread> producers;
-    producers.reserve(producerCount);
+int main() {
+    using namespace std::chrono;
 
-    //Producers pushing in values 1 second interval
-    for (int i = 0; i < producerCount; ++i) {
-        producers.emplace_back([&,i] {
-            auto interval = std::chrono::seconds(1);
-            auto nextTime = std::chrono::steady_clock::now();
+    const size_t capacity = 1 << 20; // biggish ring to minimize backpressure
+    const std::chrono::seconds bench_time = std::chrono::seconds(10);
 
-            // give each producer its own value range
-            int value = (i+1)*100; // 1000, 2000, ...
+    std::cout << "Running Lock-Free SPSC Queue benchmark, capacity=" << capacity
+        << ", time=" << bench_time.count() << "s\n";
 
-            while (!shutdown.load(std::memory_order_acquire)) {
-                std::this_thread::sleep_until(nextTime);
-                if (shutdown.load(std::memory_order_acquire))
-                    break;
-                //Adding log slows down, but adding for demo
-                logServer.push("[producer " + std::to_string(i) + "] pushing :" + std::to_string(value) + "\n");
-                auto pushed = mpscq.push(value);
-                while (!pushed)
-                {
-                    pushed = mpscq.push(value);
-                }
-                ++value;
+	// Lock-free SPSC queue
+    SPSCQueue<uint64_t> lf(capacity);
+    auto lfPush = [&](uint64_t v) { return lf.try_push(v); };
+    auto lfPop = [&](uint64_t& o) { return lf.try_pop(o); };
+    auto resLF = run_spsc_bench(lfPush, lfPop, bench_time);
 
-                nextTime += interval;
-            }
-            });
-    }
+    std::cout << "Running Mutex-SPSC Queue benchmark, capacity=" << capacity
+        << ", time=" << bench_time.count() << "s\n";
 
-    // let everything run for 60s
-    std::this_thread::sleep_for(std::chrono::seconds(10));
-    shutdown.store(true, std::memory_order_release);
+	// Mutex-based bounded queue
+    MutexBoundedQueue<uint64_t> mq(capacity);
+    auto mPush = [&](uint64_t v) { return mq.try_push(v); };
+    auto mPop = [&](uint64_t& o) { return mq.try_pop(o); };
+    auto resMQ = run_spsc_bench(mPush, mPop, bench_time);
 
-    // join producers
-    for (auto& th : producers) {
-        th.join();
-    }
-    consumerThread.join();
-    logServerThread.join();
+	// Print results
+    auto print = [](const char* name, const Result& r) {
+        std::cout << name << ":\n"
+            << "  time:       " << r.seconds << " s\n"
+            << "  produced:   " << r.produced << "\n"
+            << "  consumed:   " << r.consumed << "\n"
+            << "  throughput: " << r.throughput_mps << " M items/s\n";
+        };
 
-    std::cout << "Done.\n";
+    std::cout << "\n=== Results ===\n";
+    print("Lock-free SPSC", resLF);
+    print("Mutex SPSC", resMQ);
+
     return 0;
 }
