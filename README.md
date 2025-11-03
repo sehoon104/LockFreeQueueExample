@@ -10,8 +10,7 @@ Includes MPSC (multi-producer single-consumer) and SPSC (single-producer single-
 | Queue Type | Description |
 |-------------|-------------|
 | **SPSCQueue** | Lock-free single-producer, single-consumer ring buffer. No CAS needed; minimal atomics. |
-| **MPSCQueue** | Lock-free multi-producer, single-consumer bounded ring using per-slot sequence numbers. |
-| **MutexRingQueue** | Same ring-buffer layout but protected by a single `std::mutex` for fairness comparison. |
+| **MutexBoundedQueue** | Same ring-buffer layout but protected by a single `std::mutex` for fairness comparison. |
 
 All queues share the same buffer structure and `try_push` / `try_pop` API.
 
